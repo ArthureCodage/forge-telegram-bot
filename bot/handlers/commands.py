@@ -1,4 +1,5 @@
 import logging
+from html import escape
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -16,6 +17,7 @@ from bot.keyboards.inline import (
     get_vram_keyboard,
 )
 from bot.services.forge import forge_service
+from bot.services.queue import gpu_queue
 from bot.services.state import state_manager
 from bot.services.vram_guard import vram_guard
 
@@ -37,7 +39,7 @@ async def cmd_settings(message: Message):
         user_state["vae"] = cur_vae
 
     text = (
-        "🎛️ <b>Studio de Contrôle & Génération RTX 4090</b>\n"
+        "🎛️ <b>Studio de Contrôle &amp; Génération</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Configurez l'ensemble de vos paramètres de rendu par simple clic tactile :"
     )
@@ -58,7 +60,7 @@ async def cmd_models(message: Message):
     current = await forge_service.get_current_model()
     text = (
         f"🧠 <b>Gestionnaire de Checkpoints</b>\n"
-        f"Modèle actif : <code>{current or 'Inconnu'}</code>\n\n"
+        f"Modèle actif : <code>{escape(current or 'Inconnu')}</code>\n\n"
         f"Cliquez sur un modèle pour le charger dans la VRAM :"
     )
     await msg.edit_text(text, reply_markup=get_models_keyboard(models, current, page=0))
@@ -71,7 +73,7 @@ async def cmd_vae(message: Message):
     cur_vae = await forge_service.get_current_vae()
     text = (
         f"🔮 <b>Gestionnaire de VAE</b>\n"
-        f"VAE actif : <code>{cur_vae}</code>\n\n"
+        f"VAE actif : <code>{escape(str(cur_vae))}</code>\n\n"
         f"Sélectionnez le VAE souhaité :"
     )
     await message.answer(text, reply_markup=get_vaes_keyboard(vaes, cur_vae, page=0))
@@ -84,7 +86,7 @@ async def cmd_sampler(message: Message):
     user_state = state_manager.get_user_state(user_id)
     samplers = await forge_service.get_samplers()
     cur_sampler = user_state.get("sampler", "Euler a")
-    text = f"🎯 <b>Méthode d'Échantillonnage (Sampling Method) :</b>\nActuel : <code>{cur_sampler}</code>"
+    text = f"🎯 <b>Méthode d'Échantillonnage (Sampling Method) :</b>\nActuel : <code>{escape(str(cur_sampler))}</code>"
     await message.answer(text, reply_markup=get_samplers_keyboard(samplers, cur_sampler, page=0))
 
 
@@ -95,7 +97,7 @@ async def cmd_scheduler(message: Message):
     user_state = state_manager.get_user_state(user_id)
     schedulers = await forge_service.get_schedulers()
     cur_sched = user_state.get("scheduler", "Karras")
-    text = f"📈 <b>Type de Schedule (Scheduler) :</b>\nActuel : <code>{cur_sched}</code>"
+    text = f"📈 <b>Type de Schedule (Scheduler) :</b>\nActuel : <code>{escape(str(cur_sched))}</code>"
     await message.answer(text, reply_markup=get_schedulers_keyboard(schedulers, cur_sched))
 
 
@@ -126,7 +128,7 @@ async def cmd_dimensions(message: Message):
     user_state = state_manager.get_user_state(user_id)
     w = user_state.get("width", 1024)
     h = user_state.get("height", 1024)
-    text = f"📐 <b>Grandeur & Résolution d'image :</b>\nActuel : <b>{w}x{h}</b>"
+    text = f"📐 <b>Grandeur &amp; Résolution d'image :</b>\nActuel : <b>{w}x{h}</b>"
     await message.answer(text, reply_markup=get_dimensions_keyboard(w, h))
 
 
@@ -137,7 +139,7 @@ async def cmd_batch(message: Message):
     user_state = state_manager.get_user_state(user_id)
     b_count = user_state.get("batch_count", 1)
     b_size = user_state.get("batch_size", 1)
-    text = "📦 <b>Gestion des Lots (Batch Count & Batch Size) :</b>"
+    text = "📦 <b>Gestion des Lots (Batch Count &amp; Batch Size) :</b>"
     await message.answer(text, reply_markup=get_batch_keyboard(b_count, b_size))
 
 
@@ -184,3 +186,23 @@ async def cmd_vram_status(message: Message):
     processes = await vram_guard.get_gpu_processes()
     text = vram_guard.format_vram_status(gpu_info, processes)
     await msg.edit_text(text, reply_markup=get_vram_keyboard())
+
+
+@router.message(Command("cancel", "stop"))
+async def cmd_cancel(message: Message):
+    """Stops the running generation, empties the queue and leaves any pending text input."""
+    user_id = message.from_user.id
+    had_input = state_manager.get_user_state(user_id).get("waiting_for") is not None
+    if had_input:
+        state_manager.update_user_state(user_id, waiting_for=None)
+
+    dropped, running = await gpu_queue.cancel_all()
+
+    lines = []
+    if running:
+        lines.append("🛑 Génération en cours interrompue.")
+    if dropped:
+        lines.append(f"🗑️ {dropped} tâche(s) retirée(s) de la file d'attente.")
+    if had_input:
+        lines.append("✏️ Saisie en attente annulée.")
+    await message.answer("\n".join(lines) or "ℹ️ Rien à annuler.")

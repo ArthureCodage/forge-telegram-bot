@@ -2,7 +2,7 @@
 
 # 🎨 Forge & Ollama Telegram Remote Studio
 
-**A production-ready, asynchronous Telegram Bot acting as a tactile mobile remote control and generation studio for local Stable Diffusion WebUI Forge Neo and Ollama on Linux VPS.**
+**An asynchronous Telegram Bot acting as a tactile mobile remote control and generation studio for local Stable Diffusion WebUI Forge Neo and Ollama on Linux VPS.**
 
 [![Python Version](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
 [![Aiogram Version](https://img.shields.io/badge/aiogram-v3.x-2CA5E0.svg?logo=telegram)](https://github.com/aiogram/aiogram)
@@ -16,15 +16,17 @@
 
 ## 🌟 Overview & Key Features
 
-* 🔒 **Strict Whitelist Security (Middleware) :** Only authorized Telegram User IDs defined in `ALLOWED_USER_IDS` can interact with the bot. Unauthorized messages and callbacks are dropped immediately at the outermost middleware level.
+* 🔒 **Strict Whitelist Security (Middleware) :** Only authorized Telegram User IDs defined in `ALLOWED_USER_IDS` can interact with the bot. Unauthorized messages and callbacks are rejected at the middleware level, before any handler runs.
 * ⚡ **Zero-Port Long Polling :** Fully private. Runs entirely via Telegram Long Polling (`getUpdates`); no public ports or webhooks need to be opened on the VPS.
-* 🧠 **VRAM Guard & Sequential Orchestration :** Automatically orchestrates VRAM between Ollama LLMs and Forge Neo. During **Magic Prompt** enhancement, Ollama executes with `keep_alive: 0` so the model is unloaded from VRAM the millisecond token generation finishes, freeing 100% of the 24GB VRAM for Stable Diffusion.
+* 🧠 **VRAM Guard & Sequential Orchestration :** Ollama and Forge Neo never run at the same time: the **Magic Prompt** rewrite is a step of the GPU job queue, executed right before the Forge call. During enhancement, Ollama executes with `keep_alive: 0` so the model is unloaded from VRAM the millisecond token generation finishes, freeing 100% of the 24GB VRAM for Stable Diffusion.
 * ✍️ **Architecture-Aware Prompt Enhancement (Ollama) :**
   * **Tag-Based Mode (SDXL / Pony / Illustrious) :** Converts raw descriptions into high-impact Danbooru tags with quality keywords.
   * **Natural Language Mode (Flux.1 / Krea / Chroma) :** Expands ideas into cinematic descriptive prose without tag spam.
   * Automatic stripping of reasoning blocks (`<think>...</think>`) and markdown fences.
 * 📊 **Async GPU Job Queue (`asyncio.Queue`) & Live Progress Bar :**
   * Immediate queue position notification.
+  * `/cancel` interrupts the running generation and empties the queue.
+  * Timeout scales with batch size and Hires.fix; on timeout Forge is interrupted.
   * Real-time polling of `/sdapi/v1/progress` with a live visual ASCII progress bar: `[██████░░░░] 60% | ETA: 4s`.
 * 📱 **Tactile Touch Control Center (`/settings`) :**
   * **Checkpoints :** Paginated SD model browser with 1-click VRAM loading.
@@ -34,13 +36,14 @@
   * **Steps & CFG :** Quick buttons, step increments (`-5`, `-1`, `+1`, `+5`), and manual text input.
   * **Resolution & Aspect Ratio :** 8 aspect ratios (`1:1 1024²`, `4:5 Portrait`, `9:16 Mobile`, `16:9 Cinema`, `21:9 UltraWide`, etc.) or custom dimensions.
   * **Batch Count & Batch Size :** Generate 1 to 16 images per prompt with individual image delivery.
-* 📸 **Mobile Img2Img :** Send any photo to the bot to transform it with adjustable denoising strength (`0.35 Subtle`, `0.55 Balanced`, `0.75 Creative`).
+* 📸 **Mobile Img2Img :** Send any photo to the bot to transform it (the photo's aspect ratio is kept) with adjustable denoising strength (`0.35 Subtle`, `0.55 Balanced`, `0.75 Creative`).
 * 🔄 **Post-Generation Action Bar :**
   * `🔄 Reroll` : Re-run with new random seed.
   * `✨ Remix (Ollama)` : Generate a fresh variation using Ollama.
-  * `🔍 Hires.fix / Upscale` : 1.5x Upscale with `R-ESRGAN 4x+` keeping the original seed.
+  * `🔍 Hires.fix / Upscale` : 1.5x Hires.fix with `R-ESRGAN 4x+` keeping the original seed (img2img results are enlarged directly from the saved PNG).
+  * Each button acts on the image it is attached to: its settings are saved in a `.json` file next to the PNG.
   * `📥 PNG Brut (Metadata)` : Send uncompressed PNG as document preserving A1111/Forge generation parameters for desktop drag-and-drop.
-* 🌡️ **Hardware Monitor (`/vram`) :** Real-time display of RTX 4090 VRAM usage, temperature, power draw (W), and compute processes, with a button to force-evict Ollama from VRAM.
+* 🌡️ **Hardware Monitor (`/vram`) :** Real-time display of GPU VRAM usage, temperature, power draw (W), and compute processes, with a button to force-evict Ollama from VRAM.
 
 ---
 
@@ -60,7 +63,9 @@ forge-telegram-bot/
 │   └── fix_forge_memory_leak.py # Utility patch for Forge Neo memory leak
 ├── data/
 │   ├── state.json        # Persistent user settings and state (ignored in git)
-│   └── outputs/          # Generated PNG outputs backup (ignored in git)
+│   ├── pending/          # Photo waiting for an img2img prompt (ignored in git)
+│   └── outputs/          # Generated PNGs + one metadata .json per image (ignored in git)
+├── tests/                # pytest suite (no GPU, Forge or Telegram needed)
 └── bot/
     ├── config.py         # Pydantic Settings configuration
     ├── middlewares/
@@ -69,6 +74,8 @@ forge-telegram-bot/
     │   ├── vram_guard.py # GPU metrics & Ollama VRAM eviction
     │   ├── ollama.py     # Architecture-aware prompt enhancer
     │   ├── forge.py      # Authenticated Forge Neo REST client
+    │   ├── payloads.py   # Payload builder, timeout & dimension helpers
+    │   ├── history.py    # Per-image metadata (used by the action buttons)
     │   ├── queue.py      # Async GPU job queue & live progress tracker
     │   └── state.py      # User settings persistence
     ├── handlers/
@@ -118,12 +125,13 @@ ALLOWED_USER_IDS=YOUR_TELEGRAM_USER_ID
 FORGE_API_URL=http://127.0.0.1:7860
 FORGE_AUTH_USER=forge
 FORGE_AUTH_PASS=your_forge_password
+FORGE_VAE_DIR=/home/ubuntu/ai/sd-webui-forge-neo/models/VAE
 
 # Ollama API
 OLLAMA_API_URL=http://127.0.0.1:11434
 OLLAMA_DEFAULT_MODEL=huihui_ai/qwen3-abliterated:14b
 
-# Timeouts in seconds
+# Timeouts in seconds (FORGE_TIMEOUT_SECONDS is the budget for one image)
 FORGE_TIMEOUT_SECONDS=300
 OLLAMA_TIMEOUT_SECONDS=120
 ```
@@ -162,7 +170,17 @@ journalctl -u forge-tg-bot.service -f
 | `/batch` | 📦 Configure Batch Count & Batch Size |
 | `/loras` | 🧬 Manage and dose LoRAs (`0.6`, `0.8`, `1.0`) |
 | `/presets` | ⚡ Quick architecture switcher (Flux, SDXL, Turbo) |
-| `/vram` | 📊 Real-time RTX 4090 VRAM, Wattage & Temp monitor |
+| `/vram` | 📊 Real-time GPU VRAM, Wattage & Temp monitor |
+| `/cancel` | 🛑 Interrupt the running generation, empty the queue, leave a pending text input |
+
+---
+
+## 🧪 Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
 
 ---
 

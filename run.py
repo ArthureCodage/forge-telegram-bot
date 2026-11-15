@@ -34,7 +34,8 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="batch", description="📦 Batch Count & Size"),
         BotCommand(command="loras", description="🧬 Gestionnaire LoRA"),
         BotCommand(command="presets", description="⚡ Presets d'Architecture"),
-        BotCommand(command="vram", description="📊 Moniteur GPU 4090"),
+        BotCommand(command="vram", description="📊 Moniteur GPU"),
+        BotCommand(command="cancel", description="🛑 Annuler la génération / la saisie"),
     ]
     try:
         await bot.set_my_commands(commands)
@@ -91,6 +92,7 @@ async def main():
     try:
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
+        await forge_service.close()
         await bot.session.close()
 
 

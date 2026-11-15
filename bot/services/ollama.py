@@ -25,6 +25,25 @@ Rules:
 5. NO thinking tags (<think>), NO conversational filler, NO intro, NO markdown codeblocks, NO quotes."""
 
 
+def clean_llm_output(text: str) -> str:
+    """Removes reasoning blocks, markdown fences and surrounding quotes from an LLM answer."""
+    cleaned = text.strip()
+
+    # 1. Strip reasoning thoughts (whether starting with <think> or just ending in </think>)
+    if "</think>" in cleaned:
+        cleaned = cleaned.split("</think>")[-1].strip()
+    elif "<think>" in cleaned:
+        # Unclosed block: the model ran out of tokens while thinking, nothing usable.
+        cleaned = cleaned.split("<think>")[0].strip()
+
+    # 2. Strip markdown code fences if model enclosed in ```
+    cleaned = re.sub(r"^```(?:markdown|text)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    # 3. Strip surrounding quotation marks
+    return cleaned.strip(' \n\r\t"\'`')
+
+
 class OllamaService:
     def __init__(self, base_url: str = settings.OLLAMA_API_URL):
         self.base_url = base_url.rstrip("/")
@@ -88,22 +107,9 @@ class OllamaService:
                         return prompt
 
                     data = await resp.json()
-                    enhanced = data.get("response", "").strip()
+                    enhanced = clean_llm_output(data.get("response", ""))
 
-                    # 1. Strip reasoning thoughts (whether starting with <think> or just ending in </think>)
-                    if "</think>" in enhanced:
-                        enhanced = enhanced.split("</think>")[-1].strip()
-                    else:
-                        enhanced = re.sub(r"<think>.*?</think>", "", enhanced, flags=re.DOTALL).strip()
-
-                    # 2. Strip markdown code fences if model enclosed in ```
-                    enhanced = re.sub(r"^```(?:markdown|text)?\s*", "", enhanced)
-                    enhanced = re.sub(r"\s*```$", "", enhanced)
-
-                    # 3. Strip surrounding quotation marks
-                    enhanced = enhanced.strip(' \n\r\t"\'`')
-
-                    # 4. If empty or failed, fallback to original
+                    # If empty or failed, fallback to original
                     if not enhanced:
                         return prompt
 

@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import logging
+from html import escape
 from pathlib import Path
+from typing import Any, Dict, Optional
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, FSInputFile
-from bot.config import OUTPUTS_DIR
 from bot.keyboards.inline import (
     get_batch_keyboard,
     get_cfg_keyboard,
@@ -18,9 +20,11 @@ from bot.keyboards.inline import (
     get_vaes_keyboard,
     get_vram_keyboard,
 )
+from bot.services import history
 from bot.services.forge import forge_service
 from bot.services.ollama import ollama_service
-from bot.services.queue import GenerationJob, gpu_queue
+from bot.services.payloads import build_payload
+from bot.services.queue import UPSCALE_FACTOR, GenerationJob, gpu_queue
 from bot.services.state import DEFAULT_USER_STATE, PRESETS, state_manager
 from bot.services.vram_guard import vram_guard
 
@@ -34,7 +38,7 @@ async def refresh_settings_view(query: CallbackQuery):
     cur_model = await forge_service.get_current_model()
     cur_vae = await forge_service.get_current_vae()
     await query.message.edit_text(
-        "🎛️ <b>Studio de Contrôle & Génération RTX 4090</b>\n"
+        "🎛️ <b>Studio de Contrôle &amp; Génération</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Configurez l'ensemble de vos paramètres de rendu par simple clic tactile :",
         reply_markup=get_settings_keyboard(user_state, active_model_name=cur_model, active_vae_name=cur_vae)
@@ -55,7 +59,7 @@ async def cb_menu_models(query: CallbackQuery):
     models = await forge_service.get_models()
     current = await forge_service.get_current_model()
     await query.message.edit_text(
-        f"🧠 <b>Sélection du Modèle / Checkpoint</b>\nActuel : <code>{current}</code>",
+        f"🧠 <b>Sélection du Modèle / Checkpoint</b>\nActuel : <code>{escape(str(current))}</code>",
         reply_markup=get_models_keyboard(models, current, page=page)
     )
     await query.answer()
@@ -68,11 +72,11 @@ async def cb_set_model(query: CallbackQuery):
     if 0 <= idx < len(models):
         target = models[idx]
         title = target.get("title") or target.get("model_name")
-        await query.answer("⏳ Chargement du modèle dans la VRAM 4090...", show_alert=False)
-        msg = await query.message.answer(f"⏳ <i>Chargement de <b>{title}</b> dans la VRAM...</i>")
+        await query.answer("⏳ Chargement du modèle dans la VRAM...", show_alert=False)
+        msg = await query.message.answer(f"⏳ <i>Chargement de <b>{escape(str(title))}</b> dans la VRAM...</i>")
         success = await forge_service.set_model(title)
         if success:
-            await msg.edit_text(f"✅ Modèle chargé avec succès : <b>{title}</b>")
+            await msg.edit_text(f"✅ Modèle chargé avec succès : <b>{escape(str(title))}</b>")
             state_manager.update_user_state(query.from_user.id, model=title)
             await refresh_settings_view(query)
         else:
@@ -89,7 +93,7 @@ async def cb_menu_vaes(query: CallbackQuery):
     vaes = await forge_service.get_vaes()
     cur_vae = await forge_service.get_current_vae()
     await query.message.edit_text(
-        f"🔮 <b>Sélection du VAE</b>\nActuel : <code>{cur_vae}</code>",
+        f"🔮 <b>Sélection du VAE</b>\nActuel : <code>{escape(str(cur_vae))}</code>",
         reply_markup=get_vaes_keyboard(vaes, cur_vae, page=page)
     )
     await query.answer()
@@ -101,7 +105,6 @@ async def cb_set_vae(query: CallbackQuery):
     vaes = await forge_service.get_vaes()
     if 0 <= idx < len(vaes):
         target = vaes[idx]
-        await query.answer("Application du VAE...", show_alert=False)
         success = await forge_service.set_vae(target)
         if success:
             state_manager.update_user_state(query.from_user.id, vae=target)
@@ -131,7 +134,7 @@ async def cb_menu_samplers(query: CallbackQuery):
     cur = user_state.get("sampler", "Euler a")
     samplers = await forge_service.get_samplers()
     await query.message.edit_text(
-        f"🎯 <b>Sélection de la Méthode d'Échantillonnage</b>\nActuel : <code>{cur}</code>",
+        f"🎯 <b>Sélection de la Méthode d'Échantillonnage</b>\nActuel : <code>{escape(str(cur))}</code>",
         reply_markup=get_samplers_keyboard(samplers, cur, page=page)
     )
     await query.answer()
@@ -158,7 +161,7 @@ async def cb_menu_schedulers(query: CallbackQuery):
     cur = user_state.get("scheduler", "Karras")
     schedulers = await forge_service.get_schedulers()
     await query.message.edit_text(
-        f"📈 <b>Sélection du Type de Schedule</b>\nActuel : <code>{cur}</code>",
+        f"📈 <b>Sélection du Type de Schedule</b>\nActuel : <code>{escape(str(cur))}</code>",
         reply_markup=get_schedulers_keyboard(schedulers, cur)
     )
     await query.answer()
@@ -288,7 +291,7 @@ async def cb_menu_batch(query: CallbackQuery):
     c = user_state.get("batch_count", 1)
     s = user_state.get("batch_size", 1)
     await query.message.edit_text(
-        "📦 <b>Configuration des Lots (Batch Count & Size)</b>\n"
+        "📦 <b>Configuration des Lots (Batch Count &amp; Size)</b>\n"
         "• <b>Batch Count :</b> nombre de passages successifs\n"
         "• <b>Batch Size :</b> nombre d'images générées en parallèle par passage",
         reply_markup=get_batch_keyboard(c, s)
@@ -376,7 +379,7 @@ async def cb_view_neg(query: CallbackQuery):
     neg = user_state.get("negative_prompt", "")
     text = (
         f"🚫 <b>Prompt Négatif Actuel :</b>\n\n"
-        f"<code>{neg}</code>\n\n"
+        f"<code>{escape(neg)}</code>\n\n"
         f"Pour le modifier, cliquez sur 'Éditer' et écrivez votre nouveau prompt négatif."
     )
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -505,7 +508,7 @@ async def cb_vram_free(query: CallbackQuery):
     processes = await vram_guard.get_gpu_processes()
     text = vram_guard.format_vram_status(gpu_info, processes)
     if res.get("unloaded"):
-        text += f"\n\n✅ <b>Modèles Ollama déchargés :</b> {', '.join(res['unloaded'])}"
+        text += f"\n\n✅ <b>Modèles Ollama déchargés :</b> {escape(', '.join(res['unloaded']))}"
     elif res.get("message"):
         text += f"\n\nℹ️ {res['message']}"
     try:
@@ -517,170 +520,188 @@ async def cb_vram_free(query: CallbackQuery):
 
 # ─── POST-GENERATION ACTIONS ────────────────────────────────────────────────
 
+def _resolve_generation(query: CallbackQuery) -> Optional[Dict[str, Any]]:
+    """Finds the metadata of the image the clicked button belongs to."""
+    gen_id = query.data.split(":", 1)[1]
+    meta = history.load_meta(gen_id)
+    if meta:
+        return meta
+    # Images made before per-image metadata existed: only the last one is known.
+    last_gen = state_manager.get_user_state(query.from_user.id).get("last_generation")
+    if last_gen and last_gen.get("gen_id") == gen_id:
+        return last_gen
+    return None
+
+
+def _loras_for(meta: Dict[str, Any], user_state: Dict[str, Any]) -> Dict[str, float]:
+    """LoRAs used for the original image; current ones for images saved without that info."""
+    if "loras" in meta:
+        return dict(meta["loras"])
+    return dict(user_state.get("active_loras", {}))
+
+
+async def _enqueue(query: CallbackQuery, job: GenerationJob, label: str) -> None:
+    pos = await gpu_queue.enqueue(job)
+    await job.status_message.edit_text(
+        f"⏳ <b>{label} en file d'attente (#{pos})...</b>\n<i>/cancel pour annuler</i>"
+    )
+    await query.answer()
+
+
 @router.callback_query(F.data.startswith("reroll:"))
 async def cb_reroll(query: CallbackQuery):
-    user_id = query.from_user.id
-    user_state = state_manager.get_user_state(user_id)
-    last_gen = user_state.get("last_generation")
-    if not last_gen:
-        await query.answer("Aucune génération précédente trouvée pour Reroll.", show_alert=True)
+    meta = _resolve_generation(query)
+    if not meta:
+        await query.answer("Métadonnées introuvables pour cette image.", show_alert=True)
         return
 
-    prompt = last_gen["prompt"]
-    neg_prompt = last_gen.get("negative_prompt", "")
-    active_loras = user_state.get("active_loras", {})
+    user_state = state_manager.get_user_state(query.from_user.id)
+    neg_prompt = meta.get("negative_prompt", "")
     status_msg = await query.message.answer("🔄 <i>Reroll en cours...</i>")
-    forge_prompt = forge_service.build_prompt_with_loras(prompt, active_loras)
-
-    payload = {
-        "prompt": forge_prompt,
-        "negative_prompt": neg_prompt,
-        "steps": last_gen.get("steps", user_state.get("steps", 28)),
-        "sampler_name": last_gen.get("sampler", user_state.get("sampler", "Euler a")),
-        "scheduler": last_gen.get("scheduler", user_state.get("scheduler", "Karras")),
-        "cfg_scale": last_gen.get("cfg_scale", user_state.get("cfg_scale", 6.0)),
-        "width": last_gen.get("width", 1024),
-        "height": last_gen.get("height", 1024),
-        "batch_size": user_state.get("batch_size", 1),
-        "n_iter": user_state.get("batch_count", 1),
-        "seed": -1,
-        "save_images": True,
-    }
 
     job = GenerationJob(
         job_type="txt2img",
-        user_id=user_id,
+        user_id=query.from_user.id,
         chat_id=query.message.chat.id,
-        prompt=prompt,
+        prompt=meta["prompt"],
         negative_prompt=neg_prompt,
-        payload=payload,
+        payload=build_payload(
+            meta, neg_prompt,
+            batch_size=user_state.get("batch_size", 1),
+            batch_count=user_state.get("batch_count", 1),
+        ),
         status_message=status_msg,
-        future=asyncio.get_running_loop().create_future(),
-        extra_meta={"preset": last_gen.get("preset", "sdxl")}
+        loras=_loras_for(meta, user_state),
+        extra_meta={"preset": meta.get("preset", "sdxl")},
     )
-    pos = await gpu_queue.enqueue(job)
-    await status_msg.edit_text(f"⏳ <b>Reroll en file d'attente (#{pos})...</b>")
-    await query.answer()
+    await _enqueue(query, job, "Reroll")
 
 
 @router.callback_query(F.data.startswith("remix:"))
 async def cb_remix(query: CallbackQuery):
-    user_id = query.from_user.id
-    user_state = state_manager.get_user_state(user_id)
-    last_gen = user_state.get("last_generation")
-    if not last_gen:
-        await query.answer("Aucune génération précédente trouvée pour Remix.", show_alert=True)
+    meta = _resolve_generation(query)
+    if not meta:
+        await query.answer("Métadonnées introuvables pour cette image.", show_alert=True)
         return
 
+    user_state = state_manager.get_user_state(query.from_user.id)
+    neg_prompt = meta.get("negative_prompt", "")
+    preset_key = meta.get("preset", "sdxl")
+    preset = PRESETS.get(preset_key, PRESETS["sdxl"])
     status_msg = await query.message.answer("✨ <i>Création d'une variation via Ollama...</i>")
-    raw_prompt = last_gen.get("prompt", "")
-    model_name = user_state.get("ollama_model", "huihui_ai/qwen3-abliterated:14b")
-    enhanced = await ollama_service.enhance_prompt(prompt=raw_prompt, mode="natural_language", model=model_name)
-    await vram_guard.unload_ollama()
-
-    active_loras = user_state.get("active_loras", {})
-    forge_prompt = forge_service.build_prompt_with_loras(enhanced, active_loras)
-
-    payload = {
-        "prompt": forge_prompt,
-        "negative_prompt": last_gen.get("negative_prompt", ""),
-        "steps": last_gen.get("steps", user_state.get("steps", 28)),
-        "sampler_name": last_gen.get("sampler", user_state.get("sampler", "Euler a")),
-        "scheduler": last_gen.get("scheduler", user_state.get("scheduler", "Karras")),
-        "cfg_scale": last_gen.get("cfg_scale", user_state.get("cfg_scale", 6.0)),
-        "width": last_gen.get("width", 1024),
-        "height": last_gen.get("height", 1024),
-        "batch_size": user_state.get("batch_size", 1),
-        "n_iter": user_state.get("batch_count", 1),
-        "seed": -1,
-        "save_images": True,
-    }
 
     job = GenerationJob(
         job_type="txt2img",
-        user_id=user_id,
+        user_id=query.from_user.id,
         chat_id=query.message.chat.id,
-        prompt=enhanced,
-        negative_prompt=last_gen.get("negative_prompt", ""),
-        payload=payload,
+        prompt=meta.get("prompt", ""),
+        negative_prompt=neg_prompt,
+        payload=build_payload(
+            meta, neg_prompt,
+            batch_size=user_state.get("batch_size", 1),
+            batch_count=user_state.get("batch_count", 1),
+        ),
         status_message=status_msg,
-        future=asyncio.get_running_loop().create_future(),
-        extra_meta={"preset": last_gen.get("preset", "sdxl")}
+        loras=_loras_for(meta, user_state),
+        # The Ollama rewrite happens in the GPU queue, in the style of the image's preset.
+        enhance={
+            "mode": preset.get("mode", "tag_based"),
+            "model": user_state.get("ollama_model", ""),
+        },
+        extra_meta={"preset": preset_key},
     )
-    pos = await gpu_queue.enqueue(job)
-    await status_msg.edit_text(f"⏳ <b>Remix en file d'attente (#{pos})...</b>")
-    await query.answer()
+    await _enqueue(query, job, "Remix")
 
 
 @router.callback_query(F.data.startswith("upscale:"))
 async def cb_upscale(query: CallbackQuery):
-    user_id = query.from_user.id
-    user_state = state_manager.get_user_state(user_id)
-    last_gen = user_state.get("last_generation")
-    if not last_gen:
-        await query.answer("Aucune image précédente trouvée pour l'upscale.", show_alert=True)
+    meta = _resolve_generation(query)
+    if not meta:
+        await query.answer("Métadonnées introuvables pour cette image.", show_alert=True)
         return
 
-    status_msg = await query.message.answer("🔍 <i>Hires.fix / Upscale 1.5x en préparation...</i>")
-    active_loras = user_state.get("active_loras", {})
-    forge_prompt = forge_service.build_prompt_with_loras(last_gen["prompt"], active_loras)
-
-    payload = {
-        "prompt": forge_prompt,
-        "negative_prompt": last_gen.get("negative_prompt", ""),
-        "steps": last_gen.get("steps", user_state.get("steps", 28)),
-        "sampler_name": last_gen.get("sampler", user_state.get("sampler", "Euler a")),
-        "scheduler": last_gen.get("scheduler", user_state.get("scheduler", "Karras")),
-        "cfg_scale": last_gen.get("cfg_scale", user_state.get("cfg_scale", 6.0)),
-        "width": last_gen.get("width", 1024),
-        "height": last_gen.get("height", 1024),
-        "seed": last_gen.get("seed", -1),
-        "enable_hr": True,
-        "hr_scale": 1.5,
-        "hr_upscaler": "R-ESRGAN 4x+",
-        "denoising_strength": 0.4,
-        "save_images": True,
-    }
-
-    job = GenerationJob(
-        job_type="txt2img",
-        user_id=user_id,
+    user_state = state_manager.get_user_state(query.from_user.id)
+    neg_prompt = meta.get("negative_prompt", "")
+    upscaler = user_state.get("hr_upscaler", "R-ESRGAN 4x+")
+    common = dict(
+        user_id=query.from_user.id,
         chat_id=query.message.chat.id,
-        prompt=last_gen["prompt"],
-        negative_prompt=last_gen.get("negative_prompt", ""),
-        payload=payload,
-        status_message=status_msg,
-        future=asyncio.get_running_loop().create_future(),
-        extra_meta={"preset": last_gen.get("preset", "sdxl")}
+        prompt=meta["prompt"],
+        negative_prompt=neg_prompt,
+        loras=_loras_for(meta, user_state),
     )
-    pos = await gpu_queue.enqueue(job)
-    await status_msg.edit_text(f"⏳ <b>Upscale en file d'attente (#{pos})...</b>")
-    await query.answer()
+
+    if meta.get("job_type", "txt2img") == "txt2img" and not meta.get("upscaled"):
+        # Plain txt2img: replay the same seed with Hires.fix.
+        status_msg = await query.message.answer("🔍 <i>Hires.fix 1.5x en préparation...</i>")
+        job = GenerationJob(
+            job_type="txt2img",
+            payload=build_payload(
+                meta, neg_prompt,
+                seed=meta.get("seed", -1),
+                enable_hr=True,
+                hr_scale=UPSCALE_FACTOR,
+                hr_upscaler=upscaler,
+                denoising_strength=0.4,
+            ),
+            status_message=status_msg,
+            extra_meta={"preset": meta.get("preset", "sdxl"), "upscaled": True},
+            **common,
+        )
+    else:
+        # img2img result or already upscaled image: it cannot be replayed from a seed,
+        # so enlarge the saved PNG itself.
+        source_png = history.png_path(meta.get("gen_id", ""))
+        if not source_png:
+            await query.answer("Fichier original introuvable sur le disque.", show_alert=True)
+            return
+        status_msg = await query.message.answer("🔍 <i>Agrandissement 1.5x en préparation...</i>")
+        job = GenerationJob(
+            job_type="upscale",
+            payload={"hr_upscaler": upscaler},
+            status_message=status_msg,
+            source_png=source_png,
+            source_meta=meta,
+            extra_meta={"upscaled": True},
+            **common,
+        )
+    await _enqueue(query, job, "Upscale")
 
 
 @router.callback_query(F.data.startswith("raw_png:"))
 async def cb_raw_png(query: CallbackQuery, bot: Bot):
-    gen_id = query.data.split(":")[1]
-    filename = f"{gen_id}.png"
-    filepath = OUTPUTS_DIR / filename
-    if not filepath.exists():
-        candidates = list(OUTPUTS_DIR.glob(f"*{gen_id}*.png"))
-        if candidates:
-            filepath = candidates[0]
-        else:
-            await query.answer("Fichier original introuvable sur le disque.", show_alert=True)
-            return
+    gen_id = query.data.split(":", 1)[1]
+    filepath = history.png_path(gen_id)
+    if not filepath:
+        await query.answer("Fichier original introuvable sur le disque.", show_alert=True)
+        return
 
     await query.answer("Envoi du fichier PNG non compressé...")
-    doc = FSInputFile(str(filepath), filename=filename)
     await bot.send_document(
         chat_id=query.message.chat.id,
-        document=doc,
+        document=FSInputFile(str(filepath), filename=filepath.name),
         caption="📥 <b>PNG Brut avec métadonnées intactes</b>"
     )
 
 
 # ─── IMG2IMG CALLBACKS ──────────────────────────────────────────────────────
+
+def _discard_pending_image(pending: Optional[Dict[str, Any]]) -> None:
+    if pending and pending.get("image_path"):
+        Path(pending["image_path"]).unlink(missing_ok=True)
+
+
+async def _pending_image_b64(pending: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not pending:
+        return None
+    if pending.get("image_b64"):  # state saved by an older version of the bot
+        return pending["image_b64"]
+    path = Path(pending.get("image_path") or "")
+    if not path.is_file():
+        return None
+    data = await asyncio.to_thread(path.read_bytes)
+    return base64.b64encode(data).decode("ascii")
+
 
 @router.callback_query(F.data.startswith("img2img_str:"))
 async def cb_img2img_strength(query: CallbackQuery):
@@ -688,54 +709,45 @@ async def cb_img2img_strength(query: CallbackQuery):
     user_id = query.from_user.id
     user_state = state_manager.get_user_state(user_id)
     pending = user_state.get("pending_img2img")
-    if not pending or not pending.get("image_b64"):
+    image_b64 = await _pending_image_b64(pending)
+    if not image_b64:
         await query.answer("Aucune image en attente.", show_alert=True)
         return
 
     status_msg = await query.message.answer("🎨 <i>Lancement de la transformation img2img...</i>")
-    w = user_state.get("width", 1024)
-    h = user_state.get("height", 1024)
-    active_loras = user_state.get("active_loras", {})
-    prompt = pending.get("prompt", "masterpiece, best quality")
-    forge_prompt = forge_service.build_prompt_with_loras(prompt, active_loras)
-
-    payload = {
-        "init_images": [pending["image_b64"]],
-        "prompt": forge_prompt,
-        "negative_prompt": user_state.get("negative_prompt", ""),
-        "steps": user_state.get("steps", 28),
-        "sampler_name": user_state.get("sampler", "Euler a"),
-        "scheduler": user_state.get("scheduler", "Karras"),
-        "cfg_scale": user_state.get("cfg_scale", 6.0),
-        "denoising_strength": strength,
-        "width": w,
-        "height": h,
-        "batch_size": user_state.get("batch_size", 1),
-        "n_iter": user_state.get("batch_count", 1),
-        "seed": -1,
-        "save_images": True,
-    }
+    negative_prompt = user_state.get("negative_prompt", "")
+    # Size computed from the photo's aspect ratio when it was received.
+    source = dict(user_state)
+    source["width"] = pending.get("width", user_state.get("width", 1024))
+    source["height"] = pending.get("height", user_state.get("height", 1024))
 
     job = GenerationJob(
         job_type="img2img",
         user_id=user_id,
         chat_id=query.message.chat.id,
-        prompt=prompt,
-        negative_prompt=user_state.get("negative_prompt", ""),
-        payload=payload,
+        prompt=pending.get("prompt") or "masterpiece, best quality",
+        negative_prompt=negative_prompt,
+        payload=build_payload(
+            source, negative_prompt,
+            batch_size=user_state.get("batch_size", 1),
+            batch_count=user_state.get("batch_count", 1),
+            init_images=[image_b64],
+            denoising_strength=strength,
+        ),
         status_message=status_msg,
-        future=asyncio.get_running_loop().create_future(),
-        extra_meta={"preset": user_state.get("preset", "sdxl")}
+        loras=dict(user_state.get("active_loras", {})),
+        extra_meta={"preset": user_state.get("preset", "sdxl")},
     )
+    _discard_pending_image(pending)
     state_manager.update_user_state(user_id, pending_img2img=None, waiting_for=None)
-    pos = await gpu_queue.enqueue(job)
-    await status_msg.edit_text(f"⏳ <b>img2img en file d'attente (#{pos})...</b>")
-    await query.answer()
+    await _enqueue(query, job, "img2img")
 
 
 @router.callback_query(F.data == "cancel_img2img")
 async def cb_cancel_img2img(query: CallbackQuery):
-    state_manager.update_user_state(query.from_user.id, pending_img2img=None, waiting_for=None)
+    user_id = query.from_user.id
+    _discard_pending_image(state_manager.get_user_state(user_id).get("pending_img2img"))
+    state_manager.update_user_state(user_id, pending_img2img=None, waiting_for=None)
     await query.message.edit_text("❌ <b>Session img2img annulée.</b>")
     await query.answer("Annulé")
 

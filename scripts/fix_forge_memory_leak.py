@@ -12,7 +12,8 @@ def patch_memory_management(forge_path: Path):
         print(f"Error: {target} does not exist.")
         return False
 
-    content = target.read_text(encoding="utf-8")
+    original = target.read_text(encoding="utf-8")
+    content = original
 
     old_is_dead = """    def is_dead(self):
         return self.real_model() is not None and self.model is None"""
@@ -113,6 +114,21 @@ def cleanup_models():
         content = content.replace(old_cleanup, new_cleanup)
         print("Patched cleanup functions.")
 
+    if content == original:
+        if new_is_dead in content and new_cleanup in content:
+            print("Nothing to do: the patch is already applied.")
+            return True
+        print(
+            "Error: the expected code was not found. This Forge Neo version differs "
+            "from the one the patch was written for; nothing was changed."
+        )
+        return False
+
+    backup = target.with_name(target.name + ".bak")
+    if not backup.exists():
+        backup.write_text(original, encoding="utf-8")
+        print(f"Backup written to {backup}")
+
     target.write_text(content, encoding="utf-8")
     print("Patch successfully applied!")
     return True
@@ -120,4 +136,4 @@ def cleanup_models():
 
 if __name__ == "__main__":
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/home/ubuntu/ai/sd-webui-forge-neo")
-    patch_memory_management(path)
+    sys.exit(0 if patch_memory_management(path) else 1)

@@ -14,12 +14,16 @@ class Settings(BaseSettings):
     ALLOWED_USER_IDS: str
 
     FORGE_API_URL: str = "http://127.0.0.1:7860"
-    FORGE_AUTH_USER: str = "forge"
-    FORGE_AUTH_PASS: str = "NCd5oP5ERQYDoJYOwt3H"
+    # No default credentials: set them in .env. Leave both empty if Forge runs without --api-auth.
+    FORGE_AUTH_USER: str = ""
+    FORGE_AUTH_PASS: str = ""
+    # Folder scanned to list VAE files. If it does not exist, the Forge API is used instead.
+    FORGE_VAE_DIR: str = "/home/ubuntu/ai/sd-webui-forge-neo/models/VAE"
 
     OLLAMA_API_URL: str = "http://127.0.0.1:11434"
     OLLAMA_DEFAULT_MODEL: str = "huihui_ai/qwen3-abliterated:14b"
 
+    # Time budget for ONE image; the real timeout scales with batch size and Hires.fix.
     FORGE_TIMEOUT_SECONDS: int = 300
     OLLAMA_TIMEOUT_SECONDS: int = 120
 
@@ -36,9 +40,11 @@ class Settings(BaseSettings):
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 OUTPUTS_DIR = DATA_DIR / "outputs"
+PENDING_DIR = DATA_DIR / "pending"
 STATE_FILE = DATA_DIR / "state.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+PENDING_DIR.mkdir(parents=True, exist_ok=True)
 
 settings = Settings()
