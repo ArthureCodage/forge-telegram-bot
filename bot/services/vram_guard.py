@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from html import escape
 from typing import Any, Dict, List, Optional
 import aiohttp
 from bot.config import settings
@@ -125,7 +126,7 @@ class VRAMGuard:
     @staticmethod
     def format_vram_status(gpu_info: Dict[str, Any], processes: List[Dict[str, Any]]) -> str:
         if "error" in gpu_info:
-            return f"❌ Erreur lors de la lecture GPU : {gpu_info['error']}"
+            return f"❌ Erreur lors de la lecture GPU : {escape(str(gpu_info['error']))}"
 
         used_gb = gpu_info["used_mb"] / 1024
         total_gb = gpu_info["total_mb"] / 1024
@@ -137,9 +138,9 @@ class VRAMGuard:
         bar = "█" * filled + "░" * (10 - filled)
 
         text = (
-            f"📊 <b>Moniteur VRAM & GPU</b>\n"
+            f"📊 <b>Moniteur VRAM &amp; GPU</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"🎮 <b>GPU :</b> {gpu_info['name']}\n"
+            f"🎮 <b>GPU :</b> {escape(gpu_info['name'])}\n"
             f"📈 <b>VRAM :</b> [{bar}] {percent}%\n"
             f"💾 <b>Mémoire :</b> {used_gb:.2f} Go / {total_gb:.2f} Go (Libre : {free_gb:.2f} Go)\n"
             f"🌡️ <b>Température :</b> {gpu_info['temperature']} °C\n"
@@ -151,7 +152,7 @@ class VRAMGuard:
             text += "\n<b>Processus actifs sur GPU :</b>\n"
             for p in processes:
                 mem = p["memory_mb"] / 1024
-                text += f" • <code>{p['name']}</code> (PID {p['pid']}) : {mem:.2f} Go\n"
+                text += f" • <code>{escape(p['name'])}</code> (PID {p['pid']}) : {mem:.2f} Go\n"
         else:
             text += "\n<i>Aucun processus compute détecté.</i>\n"
 

@@ -32,6 +32,7 @@ wheels/
 data/state.json
 data/state.json.tmp
 data/outputs/*
+data/pending/
 !data/outputs/.gitkeep
 
 # IDE & OS

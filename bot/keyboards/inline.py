@@ -100,7 +100,7 @@ def get_settings_keyboard(
         [
             InlineKeyboardButton(text="🧬 LoRAs", callback_data="loras_page:0"),
             InlineKeyboardButton(text="🚫 Négatif", callback_data="view_neg"),
-            InlineKeyboardButton(text="📊 VRAM 4090", callback_data="vram_refresh"),
+            InlineKeyboardButton(text="📊 VRAM GPU", callback_data="vram_refresh"),
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)

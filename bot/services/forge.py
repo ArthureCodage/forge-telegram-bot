@@ -8,7 +8,39 @@ from bot.config import settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_VAE_PATH = Path("/home/ubuntu/ai/sd-webui-forge-neo/models/VAE")
+VAE_EXTENSIONS = {".safetensors", ".pt", ".pth", ".ckpt", ".bin", ".sft", ".gguf"}
+
+FALLBACK_SAMPLERS = [
+    "Euler a", "Euler", "DPM++ 2M", "DPM++ 2M SDE", "DPM++ SDE",
+    "DPM++ 3M SDE", "LCM", "Heun", "DDIM", "Restart", "UniPC"
+]
+
+FALLBACK_SCHEDULERS = [
+    {"name": "automatic", "label": "Automatic"},
+    {"name": "karras", "label": "Karras"},
+    {"name": "exponential", "label": "Exponential"},
+    {"name": "simple", "label": "Simple"},
+    {"name": "normal", "label": "Normal"},
+    {"name": "sgm_uniform", "label": "SGM Uniform"},
+    {"name": "align_your_steps", "label": "Align Your Steps"},
+    {"name": "turbo", "label": "Turbo"},
+    {"name": "ddim", "label": "DDIM"},
+]
+
+GENERATION_ENDPOINTS = {
+    "txt2img": "/sdapi/v1/txt2img",
+    "img2img": "/sdapi/v1/img2img",
+}
+
+
+class ForgeError(RuntimeError):
+    """Forge answered with an error, or with an unusable response."""
+
+
+def _decode_image(b64: str) -> bytes:
+    if "," in b64:
+        b64 = b64.split(",", 1)[1]
+    return base64.b64decode(b64)
 
 
 class ForgeService:
@@ -17,255 +49,181 @@ class ForgeService:
         base_url: str = settings.FORGE_API_URL,
         user: str = settings.FORGE_AUTH_USER,
         password: str = settings.FORGE_AUTH_PASS,
+        vae_dir: str = settings.FORGE_VAE_DIR,
     ):
         self.base_url = base_url.rstrip("/")
         self.auth = aiohttp.BasicAuth(user, password) if user and password else None
+        self.vae_dir = Path(vae_dir) if vae_dir else None
+        self._session: Optional[aiohttp.ClientSession] = None
 
-    def _get_auth(self) -> Optional[aiohttp.BasicAuth]:
-        return self.auth
+    # ─── HTTP PLUMBING ──────────────────────────────────────────────────────
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """One shared session, created lazily inside the running event loop."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(auth=self.auth)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+
+    async def _request(self, method: str, path: str, *, timeout: float, payload: Any = None) -> Any:
+        """Sends a request and returns the decoded JSON body (None if the body is empty)."""
+        url = f"{self.base_url}{path}"
+        async with self._get_session().request(
+            method, url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as resp:
+            body = await resp.read()
+            if resp.status != 200:
+                detail = body.decode("utf-8", errors="replace")[:200]
+                raise ForgeError(f"Forge {path} a répondu {resp.status} : {detail}")
+            if not body:
+                return None
+            try:
+                return json.loads(body)
+            except ValueError:
+                return None
+
+    async def _get_or(self, path: str, default: Any, *, timeout: float = 15) -> Any:
+        """GET that never raises: logs and returns `default` when Forge is unreachable."""
+        try:
+            data = await self._request("GET", path, timeout=timeout)
+            return default if data is None else data
+        except Exception as e:
+            logger.warning(f"Forge GET {path} failed: {e}")
+            return default
+
+    async def _post_ok(self, path: str, payload: Any = None, *, timeout: float = 30) -> bool:
+        """POST that never raises: returns True on HTTP 200."""
+        try:
+            await self._request("POST", path, timeout=timeout, payload=payload)
+            return True
+        except Exception as e:
+            logger.error(f"Forge POST {path} failed: {e}")
+            return False
 
     # ─── MODELS / CHECKPOINTS ───────────────────────────────────────────────
 
     async def get_models(self) -> List[Dict[str, Any]]:
-        url = f"{self.base_url}/sdapi/v1/sd-models"
-        try:
-            async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-                async with session.get(url, timeout=15) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-        except Exception as e:
-            logger.error(f"Failed to fetch sd-models: {e}")
-        return []
+        return await self._get_or("/sdapi/v1/sd-models", [])
+
+    async def get_options(self) -> Dict[str, Any]:
+        return await self._get_or("/sdapi/v1/options", {})
 
     async def get_current_model(self) -> Optional[str]:
-        url = f"{self.base_url}/sdapi/v1/options"
-        try:
-            async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-                async with session.get(url, timeout=15) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("sd_model_checkpoint")
-        except Exception as e:
-            logger.error(f"Failed to fetch current model: {e}")
-        return None
+        return (await self.get_options()).get("sd_model_checkpoint")
 
     async def set_model(self, checkpoint_title: str) -> bool:
-        url = f"{self.base_url}/sdapi/v1/options"
-        payload = {"sd_model_checkpoint": checkpoint_title}
-        try:
-            timeout = aiohttp.ClientTimeout(total=90)
-            async with aiohttp.ClientSession(auth=self._get_auth(), timeout=timeout) as session:
-                async with session.post(url, json=payload) as resp:
-                    return resp.status == 200
-        except Exception as e:
-            logger.error(f"Error changing model: {e}")
-        return False
+        # Loading a large checkpoint (Flux) from disk can take several minutes.
+        return await self._post_ok(
+            "/sdapi/v1/options", {"sd_model_checkpoint": checkpoint_title}, timeout=300
+        )
 
     # ─── VAE MANAGEMENT ─────────────────────────────────────────────────────
 
     async def get_vaes(self) -> List[str]:
-        """Discovers available VAEs from Forge and filesystem."""
+        """Lists VAEs from the configured folder, or from the Forge API if the folder is missing."""
         vaes = ["Automatic", "None"]
-        # Look in VAE directory
-        if DEFAULT_VAE_PATH.exists():
-            valid_exts = {".safetensors", ".pt", ".pth", ".ckpt", ".bin", ".sft", ".gguf"}
-            for p in sorted(DEFAULT_VAE_PATH.glob("*")):
-                if p.is_file() and p.suffix.lower() in valid_exts:
-                    if not p.name.endswith(".preview.jpg") and not p.name.endswith(".civitai.info"):
-                        if p.name not in vaes:
-                            vaes.append(p.name)
+        if self.vae_dir is not None and self.vae_dir.exists():
+            for p in sorted(self.vae_dir.glob("*")):
+                if p.is_file() and p.suffix.lower() in VAE_EXTENSIONS and p.name not in vaes:
+                    vaes.append(p.name)
+            return vaes
+
+        for item in await self._get_or("/sdapi/v1/sd-vae", []):
+            name = item.get("model_name") if isinstance(item, dict) else None
+            if name and name not in vaes:
+                vaes.append(name)
         return vaes
 
     async def get_current_vae(self) -> str:
-        url = f"{self.base_url}/sdapi/v1/options"
-        try:
-            async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("sd_vae", "Automatic")
-        except Exception:
-            pass
-        return "Automatic"
+        return (await self.get_options()).get("sd_vae") or "Automatic"
 
     async def set_vae(self, vae_name: str) -> bool:
-        url = f"{self.base_url}/sdapi/v1/options"
-        payload = {"sd_vae": vae_name}
-        try:
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(auth=self._get_auth(), timeout=timeout) as session:
-                async with session.post(url, json=payload) as resp:
-                    return resp.status == 200
-        except Exception as e:
-            logger.error(f"Error changing VAE: {e}")
-        return False
+        return await self._post_ok("/sdapi/v1/options", {"sd_vae": vae_name}, timeout=30)
 
     async def refresh_vae(self) -> bool:
-        url = f"{self.base_url}/sdapi/v1/refresh-vae"
-        try:
-            async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-                async with session.post(url, timeout=15) as resp:
-                    return resp.status == 200
-        except Exception:
-            return False
+        return await self._post_ok("/sdapi/v1/refresh-vae", timeout=15)
 
     # ─── SAMPLERS & SCHEDULERS ──────────────────────────────────────────────
 
     async def get_samplers(self) -> List[str]:
-        url = f"{self.base_url}/sdapi/v1/samplers"
-        try:
-            async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        names = [s.get("name") for s in data if s.get("name")]
-                        if names:
-                            return names
-        except Exception as e:
-            logger.warning(f"Failed to fetch samplers: {e}")
-        return [
-            "Euler a", "Euler", "DPM++ 2M", "DPM++ 2M SDE", "DPM++ SDE",
-            "DPM++ 3M SDE", "LCM", "Heun", "DDIM", "Restart", "UniPC"
-        ]
+        data = await self._get_or("/sdapi/v1/samplers", [], timeout=10)
+        names = [s.get("name") for s in data if isinstance(s, dict) and s.get("name")]
+        return names or list(FALLBACK_SAMPLERS)
 
     async def get_schedulers(self) -> List[Dict[str, str]]:
-        url = f"{self.base_url}/sdapi/v1/schedulers"
-        try:
-            async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        scheds = []
-                        for s in data:
-                            name = s.get("name")
-                            label = s.get("label", name)
-                            if name:
-                                scheds.append({"name": name, "label": label})
-                        if scheds:
-                            return scheds
-        except Exception as e:
-            logger.warning(f"Failed to fetch schedulers: {e}")
-        return [
-            {"name": "automatic", "label": "Automatic"},
-            {"name": "karras", "label": "Karras"},
-            {"name": "exponential", "label": "Exponential"},
-            {"name": "simple", "label": "Simple"},
-            {"name": "normal", "label": "Normal"},
-            {"name": "sgm_uniform", "label": "SGM Uniform"},
-            {"name": "align_your_steps", "label": "Align Your Steps"},
-            {"name": "turbo", "label": "Turbo"},
-            {"name": "ddim", "label": "DDIM"},
+        data = await self._get_or("/sdapi/v1/schedulers", [], timeout=10)
+        scheds = [
+            {"name": s["name"], "label": s.get("label") or s["name"]}
+            for s in data
+            if isinstance(s, dict) and s.get("name")
         ]
+        return scheds or [dict(s) for s in FALLBACK_SCHEDULERS]
 
     # ─── LORAS ──────────────────────────────────────────────────────────────
 
     async def get_loras(self) -> List[Dict[str, Any]]:
-        url = f"{self.base_url}/sdapi/v1/loras"
-        try:
-            async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-                async with session.get(url, timeout=15) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-        except Exception as e:
-            logger.error(f"Failed to fetch loras: {e}")
-        return []
+        return await self._get_or("/sdapi/v1/loras", [])
 
     async def refresh_loras(self) -> bool:
-        url = f"{self.base_url}/sdapi/v1/refresh-loras"
-        try:
-            async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-                async with session.post(url, timeout=30) as resp:
-                    return resp.status == 200
-        except Exception as e:
-            logger.error(f"Error refreshing loras: {e}")
-            return False
+        return await self._post_ok("/sdapi/v1/refresh-loras", timeout=30)
 
-    # ─── PROGRESS & GENERATION ──────────────────────────────────────────────
+    # ─── PROGRESS, INTERRUPT & GENERATION ───────────────────────────────────
 
     async def get_progress(self) -> Dict[str, Any]:
-        url = f"{self.base_url}/sdapi/v1/progress"
         try:
-            async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
+            data = await self._request("GET", "/sdapi/v1/progress", timeout=5)
+            if isinstance(data, dict):
+                return data
         except Exception:
             pass
         return {"progress": 0.0, "eta_relative": 0.0}
 
-    @staticmethod
-    def build_prompt_with_loras(prompt: str, active_loras: Dict[str, float]) -> str:
-        if not active_loras:
-            return prompt
-        lora_tags = []
-        for name, weight in active_loras.items():
-            if weight and weight > 0:
-                lora_tags.append(f"<lora:{name}:{weight:.2f}>")
-        if lora_tags:
-            return f"{prompt.strip()} {' '.join(lora_tags)}"
-        return prompt
+    async def interrupt(self) -> bool:
+        """Asks Forge to stop the generation in progress."""
+        return await self._post_ok("/sdapi/v1/interrupt", timeout=10)
 
-    async def txt2img(self, payload: Dict[str, Any]) -> Tuple[List[bytes], Dict[str, Any]]:
-        """
-        Executes txt2img generation. Returns list of PNG bytes (for batch) and info dict.
-        """
-        url = f"{self.base_url}/sdapi/v1/txt2img"
-        timeout = aiohttp.ClientTimeout(total=settings.FORGE_TIMEOUT_SECONDS)
-        async with aiohttp.ClientSession(auth=self._get_auth(), timeout=timeout) as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    raise RuntimeError(f"Forge txt2img failed ({resp.status}): {err[:200]}")
+    async def generate(
+        self, job_type: str, payload: Dict[str, Any], *, timeout: float
+    ) -> Tuple[List[bytes], Dict[str, Any]]:
+        """Runs txt2img or img2img. Returns the PNG bytes of each image and the info dict."""
+        path = GENERATION_ENDPOINTS[job_type]
+        data = await self._request("POST", path, timeout=timeout, payload=payload) or {}
 
-                data = await resp.json()
-                images_b64 = data.get("images", [])
-                if not images_b64:
-                    raise RuntimeError("Forge txt2img n'a retourné aucune image.")
+        images_b64 = data.get("images") or []
+        if not images_b64:
+            raise ForgeError(f"Forge {job_type} n'a retourné aucune image.")
 
-                result_images: List[bytes] = []
-                for b64 in images_b64:
-                    if "," in b64:
-                        b64 = b64.split(",", 1)[1]
-                    result_images.append(base64.b64decode(b64))
+        info_raw = data.get("info", "{}")
+        try:
+            info = json.loads(info_raw) if isinstance(info_raw, str) else dict(info_raw)
+        except Exception:
+            info = {"info": str(info_raw)}
 
-                info_raw = data.get("info", "{}")
-                try:
-                    info_dict = json.loads(info_raw) if isinstance(info_raw, str) else info_raw
-                except Exception:
-                    info_dict = {"info": str(info_raw)}
+        # If Forge still prepended a grid, skip it so images line up with all_seeds.
+        first = int(info.get("index_of_first_image") or 0)
+        if 0 < first < len(images_b64):
+            images_b64 = images_b64[first:]
 
-                return result_images, info_dict
+        return [_decode_image(b64) for b64 in images_b64], info
 
-    async def img2img(self, payload: Dict[str, Any]) -> Tuple[List[bytes], Dict[str, Any]]:
-        """
-        Executes img2img generation. Returns list of PNG bytes and info dict.
-        """
-        url = f"{self.base_url}/sdapi/v1/img2img"
-        timeout = aiohttp.ClientTimeout(total=settings.FORGE_TIMEOUT_SECONDS)
-        async with aiohttp.ClientSession(auth=self._get_auth(), timeout=timeout) as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    raise RuntimeError(f"Forge img2img failed ({resp.status}): {err[:200]}")
-
-                data = await resp.json()
-                images_b64 = data.get("images", [])
-                if not images_b64:
-                    raise RuntimeError("Forge img2img n'a retourné aucune image.")
-
-                result_images: List[bytes] = []
-                for b64 in images_b64:
-                    if "," in b64:
-                        b64 = b64.split(",", 1)[1]
-                    result_images.append(base64.b64decode(b64))
-
-                info_raw = data.get("info", "{}")
-                try:
-                    info_dict = json.loads(info_raw) if isinstance(info_raw, str) else info_raw
-                except Exception:
-                    info_dict = {"info": str(info_raw)}
-
-                return result_images, info_dict
+    async def upscale_image(
+        self, image: bytes, *, scale: float, upscaler: str, timeout: float
+    ) -> bytes:
+        """Upscales an existing image with the 'Extras' endpoint (no re-generation)."""
+        payload = {
+            "image": base64.b64encode(image).decode("ascii"),
+            "upscaling_resize": scale,
+            "upscaler_1": upscaler,
+        }
+        data = await self._request(
+            "POST", "/sdapi/v1/extra-single-image", timeout=timeout, payload=payload
+        ) or {}
+        if not data.get("image"):
+            raise ForgeError("Forge n'a retourné aucune image agrandie.")
+        return _decode_image(data["image"])
 
 
 forge_service = ForgeService()
