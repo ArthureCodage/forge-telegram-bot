@@ -1,0 +1,19 @@
+[Unit]
+Description=Forge Neo & Ollama Telegram Remote Studio Bot
+After=network.target forge-neo.service ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/forge-telegram-bot
+Environment="PATH=/home/ubuntu/forge-telegram-bot/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/home/ubuntu/forge-telegram-bot/.venv/bin/python run.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
