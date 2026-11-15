@@ -23,7 +23,7 @@ from bot.keyboards.inline import (
 from bot.services import history
 from bot.services.forge import forge_service
 from bot.services.ollama import ollama_service
-from bot.services.payloads import build_payload
+from bot.services.payloads import build_payload, pick_upscaler
 from bot.services.queue import UPSCALE_FACTOR, GenerationJob, gpu_queue
 from bot.services.state import DEFAULT_USER_STATE, PRESETS, state_manager
 from bot.services.vram_guard import vram_guard
@@ -622,7 +622,9 @@ async def cb_upscale(query: CallbackQuery):
 
     user_state = state_manager.get_user_state(query.from_user.id)
     neg_prompt = meta.get("negative_prompt", "")
-    upscaler = user_state.get("hr_upscaler", "R-ESRGAN 4x+")
+    upscaler = pick_upscaler(
+        user_state.get("hr_upscaler", "R-ESRGAN 4x+"), await forge_service.get_upscalers()
+    )
     common = dict(
         user_id=query.from_user.id,
         chat_id=query.message.chat.id,

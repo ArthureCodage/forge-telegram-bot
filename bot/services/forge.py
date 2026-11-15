@@ -162,6 +162,11 @@ class ForgeService:
         ]
         return scheds or [dict(s) for s in FALLBACK_SCHEDULERS]
 
+    async def get_upscalers(self) -> List[str]:
+        """Upscaler names installed in this Forge (empty list if the API cannot be reached)."""
+        data = await self._get_or("/sdapi/v1/upscalers", [], timeout=10)
+        return [u.get("name") for u in data if isinstance(u, dict) and u.get("name")]
+
     # ─── LORAS ──────────────────────────────────────────────────────────────
 
     async def get_loras(self) -> List[Dict[str, Any]]:

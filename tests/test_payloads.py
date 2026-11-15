@@ -68,3 +68,13 @@ def test_png_size():
     header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", 1536, 1024)
     assert png_size(header) == (1536, 1024)
     assert png_size(b"\xff\xd8\xff not a png, long enough to pass the length test") is None
+
+
+def test_pick_upscaler_falls_back_to_an_installed_one():
+    from bot.services.payloads import pick_upscaler
+
+    installed = ["None", "Lanczos", "Nearest", "ESRGAN"]
+    assert pick_upscaler("ESRGAN", installed) == "ESRGAN"
+    assert pick_upscaler("R-ESRGAN 4x+", installed) == "ESRGAN"
+    assert pick_upscaler("R-ESRGAN 4x+", ["None", "Lanczos", "Nearest"]) == "Lanczos"
+    assert pick_upscaler("R-ESRGAN 4x+", []) == "R-ESRGAN 4x+"

@@ -2,7 +2,7 @@
 import math
 import re
 import struct
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 MIN_SIDE = 256
 MAX_SIDE = 2048
@@ -95,3 +95,21 @@ def png_size(data: bytes) -> Optional[Tuple[int, int]]:
         return None
     width, height = struct.unpack(">II", data[16:24])
     return width, height
+
+
+_BASIC_UPSCALERS = ("None", "Lanczos", "Nearest")
+
+
+def pick_upscaler(preferred: str, available: List[str]) -> str:
+    """Returns an upscaler this Forge actually has.
+
+    Forge answers 500 when asked for an upscaler it does not have, so fall back to the
+    first model-based one installed, then to Lanczos. An empty list means the API could
+    not be queried: keep the preferred name.
+    """
+    if not available or preferred in available:
+        return preferred
+    for name in available:
+        if name not in _BASIC_UPSCALERS:
+            return name
+    return "Lanczos" if "Lanczos" in available else available[0]
