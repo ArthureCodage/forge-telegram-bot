@@ -7,7 +7,7 @@ from html import escape
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from aiogram import Bot
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, InputMediaPhoto, Message
 from bot.config import OUTPUTS_DIR, settings
 from bot.services import history
 from bot.services.forge import forge_service
@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 UPSCALE_FACTOR = 1.5
 MAX_CAPTION_PROMPT = 500
+MAX_ALBUM_SIZE = 10  # Telegram limit for one media group
+MAX_CAPTION_SEEDS = 10
 
 
 @dataclass
@@ -64,17 +66,49 @@ def build_caption(meta: Dict[str, Any], index: int, total: int) -> str:
     )
 
 
+def build_batch_caption(metas: List[Dict[str, Any]]) -> str:
+    """Single HTML caption for a whole batch, shown once under the album."""
+    first = metas[0]
+    prompt = first.get("prompt", "")
+    if len(prompt) > MAX_CAPTION_PROMPT:
+        prompt = prompt[: MAX_CAPTION_PROMPT - 3] + "..."
+
+    seeds = ", ".join(str(m.get("seed", "?")) for m in metas[:MAX_CAPTION_SEEDS])
+    if len(metas) > MAX_CAPTION_SEEDS:
+        seeds += ", ..."
+    width = first.get("final_width", first.get("width"))
+    height = first.get("final_height", first.get("height"))
+
+    return (
+        f"✨ <b>{len(metas)} images générées en {first.get('gen_time', 0)}s</b>\n\n"
+        f"📝 <b>Prompt :</b> <i>{escape(prompt)}</i>\n"
+        f"🎲 <b>Seeds :</b> <code>{escape(seeds)}</code>\n"
+        f"🧠 <b>Modèle :</b> <code>{escape(str(first.get('model', '?')))}</code>\n"
+        f"🎯 <b>Sampler :</b> {escape(str(first.get('sampler', '?')))} "
+        f"({escape(str(first.get('scheduler', '?')))}) | Steps: {first.get('steps', '?')} "
+        f"| CFG: {first.get('cfg_scale', '?')}\n"
+        f"📐 <b>Format :</b> {width}x{height}"
+    )
+
+
 class GPUQueue:
     def __init__(self):
         self._queue: asyncio.Queue[GenerationJob] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
         self._bot: Optional[Bot] = None
         self._post_keyboard_builder: Optional[Callable[[str], Any]] = None
+        self._batch_keyboard_builder: Optional[Callable[[List[str]], Any]] = None
         self._current: Optional[GenerationJob] = None
 
-    def start(self, bot: Bot, post_keyboard_builder: Callable[[str], Any]):
+    def start(
+        self,
+        bot: Bot,
+        post_keyboard_builder: Callable[[str], Any],
+        batch_keyboard_builder: Optional[Callable[[List[str]], Any]] = None,
+    ):
         self._bot = bot
         self._post_keyboard_builder = post_keyboard_builder
+        self._batch_keyboard_builder = batch_keyboard_builder
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._worker_loop())
             logger.info("GPU Queue worker loop started.")
@@ -231,7 +265,7 @@ class GPUQueue:
         ]
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         total_images = len(images_bytes)
-        last_meta = None
+        results: List[Tuple[bytes, Dict[str, Any]]] = []
 
         for idx, img_data in enumerate(images_bytes):
             seed = all_seeds[idx] if idx < len(all_seeds) else all_seeds[0]
@@ -270,23 +304,55 @@ class GPUQueue:
                 gen_meta["final_width"], gen_meta["final_height"] = size
 
             await asyncio.to_thread(history.save_meta, gen_meta)
-            last_meta = gen_meta
+            results.append((img_data, gen_meta))
 
+        if len(results) == 1:
+            img_data, gen_meta = results[0]
+            gen_id = gen_meta["gen_id"]
             reply_markup = self._post_keyboard_builder(gen_id) if self._post_keyboard_builder else None
             await self._bot.send_photo(
                 chat_id=job.chat_id,
                 photo=BufferedInputFile(img_data, filename=f"gen_{gen_id}.png"),
-                caption=build_caption(gen_meta, idx, total_images),
+                caption=build_caption(gen_meta, 0, 1),
                 reply_markup=reply_markup,
             )
+        elif results:
+            await self._send_batch(job.chat_id, results)
 
-        if last_meta:
-            state_manager.update_user_state(job.user_id, last_generation=last_meta)
+        if results:
+            state_manager.update_user_state(job.user_id, last_generation=results[-1][1])
 
         try:
             await job.status_message.delete()
         except Exception:
             pass
+
+    async def _send_batch(self, chat_id: int, results: List[Tuple[bytes, Dict[str, Any]]]) -> None:
+        """Sends a batch as one album with a single caption instead of one message per image."""
+        caption = build_batch_caption([meta for _, meta in results])
+        for start in range(0, len(results), MAX_ALBUM_SIZE):
+            chunk = results[start:start + MAX_ALBUM_SIZE]
+            media = [
+                InputMediaPhoto(
+                    media=BufferedInputFile(img, filename=f"gen_{meta['gen_id']}.png"),
+                    caption=caption if start == 0 and i == 0 else None,
+                    parse_mode="HTML",
+                )
+                for i, (img, meta) in enumerate(chunk)
+            ]
+            if len(media) == 1:
+                # Telegram refuses an album of one: happens for the 11th image of a batch.
+                await self._bot.send_photo(chat_id=chat_id, photo=media[0].media)
+            else:
+                await self._bot.send_media_group(chat_id=chat_id, media=media)
+
+        # An album cannot carry buttons, so the actions go in one compact message.
+        if self._batch_keyboard_builder:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text="🎛️ <b>Actions par image</b> (numérotées dans l'ordre de l'album)",
+                reply_markup=self._batch_keyboard_builder([meta["gen_id"] for _, meta in results]),
+            )
 
 
 gpu_queue = GPUQueue()

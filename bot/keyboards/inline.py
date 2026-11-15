@@ -427,6 +427,23 @@ def get_post_generation_keyboard(gen_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
+def get_batch_actions_keyboard(gen_ids: List[str]) -> InlineKeyboardMarkup:
+    """One row of actions per image of a batch (an album cannot carry buttons itself)."""
+    keyboard = [
+        [
+            InlineKeyboardButton(text=f"{n} 🔄", callback_data=f"reroll:{gen_id}"),
+            InlineKeyboardButton(text=f"{n} ✨", callback_data=f"remix:{gen_id}"),
+            InlineKeyboardButton(text=f"{n} 🔍", callback_data=f"upscale:{gen_id}"),
+            InlineKeyboardButton(text=f"{n} 📥", callback_data=f"raw_png:{gen_id}"),
+        ]
+        for n, gen_id in enumerate(gen_ids, start=1)
+    ]
+    keyboard.append([
+        InlineKeyboardButton(text="🔄 Reroll · ✨ Remix · 🔍 Upscale · 📥 PNG", callback_data="noop")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
 def get_vram_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [

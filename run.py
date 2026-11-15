@@ -7,7 +7,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 from bot.config import settings
 from bot.handlers import main_router
-from bot.keyboards.inline import get_post_generation_keyboard
+from bot.keyboards.inline import get_batch_actions_keyboard, get_post_generation_keyboard
 from bot.middlewares.auth import AuthMiddleware
 from bot.services.forge import forge_service
 from bot.services.ollama import ollama_service
@@ -83,7 +83,7 @@ async def main():
 
     dp.include_router(main_router)
 
-    gpu_queue.start(bot, get_post_generation_keyboard)
+    gpu_queue.start(bot, get_post_generation_keyboard, get_batch_actions_keyboard)
 
     await check_backends()
     await set_bot_commands(bot)

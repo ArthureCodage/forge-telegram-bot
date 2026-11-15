@@ -28,9 +28,17 @@ class FakeMessage:
 class FakeBot:
     def __init__(self):
         self.photos = []
+        self.albums = []
+        self.messages = []
 
     async def send_photo(self, **kwargs):
         self.photos.append(kwargs)
+
+    async def send_media_group(self, **kwargs):
+        self.albums.append(kwargs)
+
+    async def send_message(self, **kwargs):
+        self.messages.append(kwargs)
 
 
 class FakeForge:
@@ -100,7 +108,7 @@ def make_job(**overrides):
 async def run_jobs(jobs):
     bot = FakeBot()
     gpu_queue = GPUQueue()
-    gpu_queue.start(bot, lambda gen_id: f"kb:{gen_id}")
+    gpu_queue.start(bot, lambda gen_id: f"kb:{gen_id}", lambda gen_ids: list(gen_ids))
     for job in jobs:
         await gpu_queue.enqueue(job)
     await asyncio.wait_for(gpu_queue._queue.join(), timeout=10)
@@ -136,12 +144,28 @@ def test_job_sends_image_with_escaped_caption_and_saves_metadata(env):
     assert job.status_message.deleted
 
 
-def test_batch_images_get_their_own_seed_and_metadata(env):
+def test_batch_is_sent_as_one_album_with_a_single_caption(env):
     forge, _, outputs = env
     forge.images = 3
     bot = asyncio.run(run_jobs([make_job()]))
 
-    assert len(bot.photos) == 3
+    # One album, not one long message per image.
+    assert bot.photos == []
+    assert len(bot.albums) == 1
+    media = bot.albums[0]["media"]
+    assert len(media) == 3
+    assert [m.caption is not None for m in media] == [True, False, False]
+    assert "3 images" in media[0].caption
+    assert "100, 101, 102" in media[0].caption
+    assert "un chat &lt;lora:x:1&gt; &amp; co" in media[0].caption
+    assert len(media[0].caption) < 1024
+
+    # Buttons cannot sit on an album: one message carries the actions of every image.
+    assert len(bot.messages) == 1
+    gen_ids = bot.messages[0]["reply_markup"]
+    assert len(gen_ids) == 3
+    assert all((outputs / f"{g}.png").exists() for g in gen_ids)
+
     seeds = sorted(
         json.loads(p.read_text(encoding="utf-8"))["seed"]
         for p in outputs.glob("*.json") if p.name != "state.json"
@@ -216,6 +240,27 @@ def test_cancel_interrupts_running_job_and_drops_waiting_ones(env):
     assert bot.photos == []  # the partial image is not delivered
     assert "annulée" in running.status_message.texts[-1]
     assert "annulée" in waiting.status_message.texts[-1]
+
+
+def test_batch_over_ten_images_is_split_into_albums(env):
+    forge, _, _ = env
+    forge.images = 11
+    bot = asyncio.run(run_jobs([make_job()]))
+
+    assert [len(a["media"]) for a in bot.albums] == [10]
+    assert len(bot.photos) == 1  # the 11th image cannot form an album on its own
+    assert len(bot.messages[0]["reply_markup"]) == 11
+
+
+def test_batch_keyboard_has_one_row_of_actions_per_image():
+    from bot.keyboards.inline import get_batch_actions_keyboard
+
+    rows = get_batch_actions_keyboard(["20261115_120000_1_0", "20261115_120000_2_1"]).inline_keyboard
+    assert [b.callback_data for b in rows[1]] == [
+        "reroll:20261115_120000_2_1", "remix:20261115_120000_2_1",
+        "upscale:20261115_120000_2_1", "raw_png:20261115_120000_2_1",
+    ]
+    assert all(len(b.callback_data.encode()) <= 64 for row in rows for b in row)
 
 
 def test_caption_truncates_long_prompts():
